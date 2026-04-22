@@ -1,0 +1,17 @@
+{
+  "devices": {
+    "PSIGEIO": "10.5.2.198",
+    "KATAPSIKTIS": "10.5.2.128",
+    "EKTIPOTIS": "10.5.2.111"
+  },
+  "telegram-token": "your_bot_token_here",
+  "telegram-chat-id": "your_chat_id_here",
+  "interval": "60s",
+  "failure-threshold": 3,
+  "recovery-notify": true,
+  "ping-timeout": "5s",
+  "debug": false,
+  "log-file": "/var/log/iotping.log",
+  "repeat-interval": "1h",
+  "max-repeat-notifications": 3
+}

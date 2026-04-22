@@ -1,0 +1,6 @@
+config.json
+iotping
+*.log
+.DS_Store
+*.swp
+*~
