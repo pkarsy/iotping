@@ -4,19 +4,23 @@ A simple ICMP-based device monitor with Telegram notifications. Pings devices at
 
 ## Features
 
-- **ICMP-only monitoring** - Uses raw ping, no TCP port scanning
+- **ICMP-only monitoring** - Uses raw ping, no TCP port scanning. All commercial IOT devices and fo course all open source (Tasmota etc) work.
 - **Telegram notifications** - Get alerts on your phone when devices go down
-- **LAN-based monitoring** - Works even when internet is down (as long as LAN is up)
-- **Superior to built-in IoT notifications** - Device "cloud" notifications often misfire due to internet connectivity issues; this method monitors locally and is more reliable. **Example**: For a freezer, what matters is power (is the device reachable on LAN?), not internet connectivity. A freezer can lose power but still have internet via backup, or lose internet but still be powered and working fine.
+- **LAN-based monitoring** - Works when internet is down (as long as LAN is up). It cannot send telegram messages obviously, but it can check if devices are alive.
+- **Superior in detecting problems over built-in IoT notifications** - Device "cloud" notifications often misfire due to internet connectivity issues; this method monitors locally and is more reliable. **Example**: For a WIFI plug(Tuya, Ewelink etc) connected to a freezer a network connection issue canot be distinguished from a power failure (using in App notifications), but iotping being a LAN device has no problem with this.
+- **Repeated notifications** - Configurable and can be disabled 
 - **Configurable via JSON** - Easy configuration file
 - **Debug mode** - Optional verbose logging
 - **Log file support** - Redirect output to file with `~` and `$HOME` expansion
+
 
 ## Prerequisites
 
 **Static IP addresses required**: Your LAN router/DHCP must be configured to assign static IPs to your IoT devices. This tool monitors devices by IP address, not hostname.
 
 **Use IP addresses in config**: Always use IP addresses (e.g., `192.168.1.10`) in the configuration file, not hostnames. Even if you have DNS/hostnames configured, use the IP addresses to avoid dependency on DNS resolution.
+
+**The device running iotping (presumably you home server)** must be alive 24/7 and UPS powered.
 
 ## Installation
 
@@ -82,11 +86,11 @@ EOF
 # Just run it
 ./iotping
 
-# With log file
-./iotping  # logs go to file configured in config.json
+# In background with setsid
+setsid -f ./iotping &
 
-# In background with nohup
-nohup ./iotping &
+# crontab -e
+@reboot setsid -f path/to/iotping 
 ```
 
 ## System Requirements
@@ -105,7 +109,7 @@ echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/99-ping
 sudo sysctl --system
 ```
 
-If you can't enable unprivileged ICMP, you can use capabilities:
+If you can't enable unprivileged ICMP but have root access, you can use capabilities:
 
 ```bash
 sudo setcap cap_net_raw+ep ./iotping
