@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -52,6 +51,8 @@ type Monitor struct {
 	client    *http.Client
 	icmpAvail bool // Cached: can we do unprivileged ICMP?
 	reloadCh  chan Config
+	msgQueue  []string
+	queueMu   sync.Mutex
 }
 
 // PidFile manages a PID file to prevent multiple instances
@@ -515,8 +516,9 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 			state.LastChange = time.Now()
 			state.LastNotified = time.Now()
 			state.NotifyCount = 1
+			eventTime := state.LastChange.Format("15:04")
 			m.mu.Unlock()
-			msg := fmt.Sprintf("🚨 %s OFFLINE", name)
+			msg := fmt.Sprintf("🚨 %s OFFLINE (%s)", name, eventTime)
 			log.Printf("[iotping] %s is OFFLINE", name)
 			m.notify(msg)
 			m.mu.Lock()
@@ -526,12 +528,13 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 				state.NotifyCount++
 				state.LastNotified = time.Now()
 				downtime := time.Since(state.LastChange)
+				eventTime := state.LastChange.Format("15:04")
 				m.mu.Unlock()
 				var msg string
 				if state.NotifyCount >= m.config.MaxRepeatNotifications {
-					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) - no more notifications", name, downtime.Round(time.Minute))
+					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s) - no more notifications", name, downtime.Round(time.Minute), eventTime)
 				} else {
-					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s)", name, downtime.Round(time.Minute))
+					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s)", name, downtime.Round(time.Minute), eventTime)
 				}
 				log.Printf("[iotping] %s still offline (%s) - repeat notification %d/%d", name, downtime.Round(time.Minute), state.NotifyCount, m.config.MaxRepeatNotifications)
 				m.notify(msg)
@@ -541,8 +544,9 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 	} else {
 		if !state.IsOnline && m.config.RecoveryNotify {
 			downtime := time.Since(state.LastChange)
+			eventTime := state.LastChange.Format("15:04")
 			m.mu.Unlock()
-			msg := fmt.Sprintf("✅ %s ONLINE (%s)", name, downtime.Round(time.Second))
+			msg := fmt.Sprintf("✅ %s ONLINE (%s) (%s)", name, downtime.Round(time.Second), eventTime)
 			log.Printf("[iotping] %s is BACK ONLINE (downtime: %s)", name, downtime.Round(time.Second))
 			m.notify(msg)
 			m.mu.Lock()
@@ -613,12 +617,37 @@ func (m *Monitor) checkICMP(ip string) bool {
 	return false
 }
 
+const maxQueueSize = 25
+
 func (m *Monitor) notify(message string) {
 	if m.config.TelegramToken == "" {
 		log.Printf("[iotping DRY RUN] %s", message)
 		return
 	}
 
+	// Try to flush any queued messages first
+	m.flushQueue()
+
+	// Try to send the current message
+	if m.sendTelegram(message) {
+		// Success - try to flush queue again in case more were added
+		m.flushQueue()
+	} else {
+		// Failed - add to queue
+		m.queueMu.Lock()
+		if len(m.msgQueue) >= maxQueueSize {
+			// Drop oldest message
+			m.msgQueue = m.msgQueue[1:]
+			log.Printf("[iotping] Queue full, dropping oldest message")
+		}
+		m.msgQueue = append(m.msgQueue, message)
+		queueLen := len(m.msgQueue)
+		m.queueMu.Unlock()
+		log.Printf("[iotping] Message queued (network error) - queue size: %d", queueLen)
+	}
+}
+
+func (m *Monitor) sendTelegram(message string) bool {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.config.TelegramToken)
 	payload := map[string]string{
 		"chat_id":    m.config.TelegramChatID,
@@ -629,14 +658,51 @@ func (m *Monitor) notify(message string) {
 	jsonData, _ := json.Marshal(payload)
 	resp, err := m.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Telegram error: %v", err)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Telegram API error: %s", string(body))
+		return false
+	}
+	return true
+}
+
+func (m *Monitor) flushQueue() {
+	m.queueMu.Lock()
+	if len(m.msgQueue) == 0 {
+		m.queueMu.Unlock()
+		return
+	}
+
+	// Copy queue and clear it
+	queue := make([]string, len(m.msgQueue))
+	copy(queue, m.msgQueue)
+	m.msgQueue = m.msgQueue[:0]
+	m.queueMu.Unlock()
+
+	// Try to send all queued messages
+	sent := 0
+	for _, msg := range queue {
+		if m.sendTelegram(msg) {
+			sent++
+		} else {
+			// Put remaining messages back in queue
+			m.queueMu.Lock()
+			m.msgQueue = append([]string{msg}, m.msgQueue...)
+			for _, remaining := range queue[sent+1:] {
+				m.msgQueue = append([]string{remaining}, m.msgQueue...)
+			}
+			m.queueMu.Unlock()
+			if sent > 0 {
+				log.Printf("[iotping] Sent %d queued messages, %d remain", sent, len(queue)-sent)
+			}
+			return
+		}
+	}
+
+	if sent > 0 {
+		log.Printf("[iotping] Sent %d queued messages", sent)
 	}
 }
 

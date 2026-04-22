@@ -1,8 +1,8 @@
 {
   "devices": {
-    "PSIGEIO": "10.5.2.198",
-    "KATAPSIKTIS": "10.5.2.128",
-    "EKTIPOTIS": "10.5.2.111"
+    "Refrigerator": "192.168.1.198",
+    "Frezer": "192.168.1.128",
+    "Printer": "192.168.1.111"
   },
   "telegram-token": "your_bot_token_here",
   "telegram-chat-id": "your_chat_id_here",
@@ -11,7 +11,7 @@
   "recovery-notify": true,
   "ping-timeout": "5s",
   "debug": false,
-  "log-file": "/var/log/iotping.log",
+  "log-file": "~/iotping.log",
   "repeat-interval": "1h",
   "max-repeat-notifications": 3
 }
