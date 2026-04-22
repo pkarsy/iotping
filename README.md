@@ -89,6 +89,7 @@ EOF
 # In background with setsid
 setsid -f ./iotping &
 
+# Autostart
 # crontab -e
 @reboot setsid -f path/to/iotping 
 ```
@@ -122,8 +123,8 @@ sudo ./iotping
 ```
 
 ## Systemd Service
-
-Create `/etc/systemd/system/iotping.service`:
+Instead of `crontab -e` (see above) you can
+create `/etc/systemd/system/iotping.service`:
 
 ```ini
 [Unit]
@@ -144,10 +145,8 @@ WantedBy=multi-user.target
 Enable and start:
 
 ```bash
-sudo systemctl daemon-reload
 sudo systemctl enable iotping
 sudo systemctl start iotping
-sudo systemctl status iotping
 ```
 
 ## License
