@@ -457,17 +457,24 @@ func (m *Monitor) Run(ctx context.Context) {
 	ticker := time.NewTicker(m.config.Interval)
 	defer ticker.Stop()
 
+	queueTicker := time.NewTicker(5 * time.Minute)
+	defer queueTicker.Stop()
+
 	m.checkAll(ctx)
 
 	for {
 		select {
 		case <-ticker.C:
 			m.checkAll(ctx)
+		case <-queueTicker.C:
+			m.flushQueue()
 		case newCfg := <-m.reloadCh:
 			// Config already validated by watcher before sending
 			ticker.Stop()
+			queueTicker.Stop()
 			m.Reload(newCfg)
 			ticker = time.NewTicker(m.config.Interval)
+			queueTicker = time.NewTicker(5 * time.Minute)
 			log.Println("Config reloaded, all counters reset")
 		case <-ctx.Done():
 			return
