@@ -162,6 +162,8 @@ Configuration:
     ping-timeout       - Timeout for each ping (default: 5s)
     debug              - Enable verbose logging (default: false)
     log-file           - Path to log file (optional)
+    repeat-interval    - Interval between repeat notifications (default: 1h)
+    max-repeat-notifications - Max repeat notifications while offline (default: 3)
 
 Hot Reload:
   The config file is watched for changes. When modified, the program waits
