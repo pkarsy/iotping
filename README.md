@@ -8,7 +8,8 @@ A simple ICMP-based device monitor with Telegram notifications. Pings devices at
 - **Telegram notifications** - Get alerts on your phone when devices go down
 - **LAN-based monitoring** - Works when internet is down (as long as LAN is up). It cannot send telegram messages obviously, but it can check if devices are alive.
 - **Superior in detecting problems over built-in IoT notifications** - Device "cloud" notifications often misfire due to internet connectivity issues; this method monitors locally and is more reliable. **Example**: For a WIFI plug(Tuya, Ewelink etc) connected to a freezer a network connection issue canot be distinguished from a power failure (using in App notifications), but iotping being a LAN device has no problem with this.
-- **Repeated notifications** - Configurable and can be disabled 
+- **Repeated notifications** - Configurable and can be disabled
+- **Message queue** - Caches notifications during network outages and sends them when connection is restored
 - **Configurable via JSON** - Easy configuration file
 - **Debug mode** - Optional verbose logging
 - **Log file support** - Redirect output to file with `~` and `$HOME` expansion
@@ -53,7 +54,9 @@ cat > ~/.config/iotping/config.json << 'EOF'
   "recovery-notify": true,
   "ping-timeout": "5s",
   "debug": false,
-  "log-file": "~/logs/iotping.log"
+  "log-file": "~/logs/iotping.log",
+  "repeat-interval": "1h",
+  "max-repeat-notifications": 3
 }
 EOF
 ```
