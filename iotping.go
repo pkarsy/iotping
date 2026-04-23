@@ -529,7 +529,7 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 			m.mu.Unlock()
 			msg := fmt.Sprintf("🚨 %s OFFLINE (%s)", name, eventTime)
 			log.Printf("[iotping] %s is OFFLINE", name)
-			m.notify(msg)
+			m.notify(msg, true)
 			m.mu.Lock()
 		} else if !state.IsOnline && state.NotifyCount > 0 && state.NotifyCount < m.config.MaxRepeatNotifications {
 			timeSinceLastNotify := time.Since(state.LastNotified)
@@ -546,7 +546,7 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s)", name, downtime.Round(time.Minute), eventTime)
 				}
 				log.Printf("[iotping] %s still offline (%s) - repeat notification %d/%d", name, downtime.Round(time.Minute), state.NotifyCount, m.config.MaxRepeatNotifications)
-				m.notify(msg)
+				m.notify(msg, false)
 				m.mu.Lock()
 			}
 		}
@@ -557,7 +557,7 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 			m.mu.Unlock()
 			msg := fmt.Sprintf("✅ %s ONLINE (%s) (%s)", name, downtime.Round(time.Second), eventTime)
 			log.Printf("[iotping] %s is BACK ONLINE (downtime: %s)", name, downtime.Round(time.Second))
-			m.notify(msg)
+			m.notify(msg, true)
 			m.mu.Lock()
 		}
 		if state.Failures > 0 {
@@ -628,7 +628,7 @@ func (m *Monitor) checkICMP(ip string) bool {
 
 const maxQueueSize = 25
 
-func (m *Monitor) notify(message string) {
+func (m *Monitor) notify(message string, queueOnFailure bool) {
 	if m.config.TelegramToken == "" {
 		log.Printf("[iotping DRY RUN] %s", message)
 		return
@@ -641,8 +641,8 @@ func (m *Monitor) notify(message string) {
 	if m.sendTelegram(message) {
 		// Success - try to flush queue again in case more were added
 		m.flushQueue()
-	} else {
-		// Failed - add to queue
+	} else if queueOnFailure {
+		// Failed - add to queue (only for important messages)
 		m.queueMu.Lock()
 		if len(m.msgQueue) >= maxQueueSize {
 			// Drop oldest message
