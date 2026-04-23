@@ -107,6 +107,37 @@ func (m *Monitor) debug(format string, v ...interface{}) {
 	}
 }
 
+// stripComments removes // and /* */ style comments from JSON
+func stripComments(data []byte) []byte {
+	result := make([]byte, 0, len(data))
+	i := 0
+	for i < len(data) {
+		if data[i] == '/' && i+1 < len(data) {
+			if data[i+1] == '/' {
+				// Skip // comment to end of line
+				for i < len(data) && data[i] != '\n' {
+					i++
+				}
+				continue
+			} else if data[i+1] == '*' {
+				// Skip /* */ comment
+				i += 2
+				for i+1 < len(data) {
+					if data[i] == '*' && data[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+				continue
+			}
+		}
+		result = append(result, data[i])
+		i++
+	}
+	return result
+}
+
 // expandPath expands ~ and $HOME at the start of a path
 func expandPath(path, home string) string {
 	if path == "" {
@@ -731,6 +762,9 @@ func loadConfig(path string) Config {
 	if err != nil {
 		log.Fatalf("Failed to read config file %s: %v", path, err)
 	}
+
+	// Strip comments from JSON (both // and /* */ style)
+	data = stripComments(data)
 
 	// Use a temporary struct to parse JSON with string durations
 	// Supports both hyphen and underscore variants for backward compatibility
