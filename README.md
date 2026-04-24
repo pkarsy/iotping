@@ -21,7 +21,7 @@ A simple ICMP-based device monitor with Telegram notifications. Pings devices at
 
 **Use IP addresses in config**: Always use IP addresses (e.g., `192.168.1.10`) in the configuration file, not hostnames. Even if you have DNS/hostnames configured, use the IP addresses to avoid dependency on DNS resolution.
 
-**The device running iotping (presumably your home server)** must be alive 24/7 and UPS powered. The UPS must also backup the Internel Appliances (Router, ONT, switch etc). To have Internel when the power is down.
+**The device running iotping (presumably your home server)** must be alive 24/7 and UPS powered. The UPS must also backup the Internet Appliances (Router, ONT, switch etc). To have Internet when the power is down.
 
 ## Installation
 
@@ -91,7 +91,8 @@ setsid -f ./iotping &
 
 # Autostart
 # crontab -e
-@reboot setsid -f path/to/iotping 
+@reboot setsid -f path/to/iotping
+# Or use systemd
 ```
 
 ## System Requirements
@@ -120,33 +121,6 @@ Or run as root (not recommended):
 
 ```bash
 sudo ./iotping
-```
-
-## Systemd Service
-Instead of `crontab -e` (see above) you can
-create `/etc/systemd/system/iotping.service`:
-
-```ini
-[Unit]
-Description=IoT Device Monitor
-After=network.target
-
-[Service]
-Type=simple
-User=youruser
-ExecStart=/path/to/iotping
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start:
-
-```bash
-sudo systemctl enable iotping
-sudo systemctl start iotping
 ```
 
 ## License
