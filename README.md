@@ -4,7 +4,7 @@ A simple ICMP-based device monitor with Telegram notifications. Pings devices at
 
 ## Features
 
-- **ICMP-only monitoring** - Uses raw ping, no TCP port scanning. All commercial IOT devices and fo course all open source (Tasmota etc) work.
+- **ICMP-only monitoring** - Uses raw ping, no TCP port scanning. All tested commercial IOT devices(Ewelink, Tuya) and of course all open source (Tasmota etc) work.
 - **Telegram notifications** - Get alerts on your phone when devices go down
 - **LAN-based monitoring** - Works when internet is down (as long as LAN is up). It cannot send telegram messages obviously, but it can check if devices are alive.
 - **Superior in detecting problems over built-in IoT notifications** - Device "cloud" notifications often misfire due to internet connectivity issues; this method monitors locally and is more reliable. **Example**: For a WIFI plug(Tuya, Ewelink etc) connected to a freezer a network connection issue canot be distinguished from a power failure (using in App notifications), but iotping being a LAN device has no problem with this.
@@ -21,16 +21,13 @@ A simple ICMP-based device monitor with Telegram notifications. Pings devices at
 
 **Use IP addresses in config**: Always use IP addresses (e.g., `192.168.1.10`) in the configuration file, not hostnames. Even if you have DNS/hostnames configured, use the IP addresses to avoid dependency on DNS resolution.
 
-**The device running iotping (presumably you home server)** must be alive 24/7 and UPS powered.
+**The device running iotping (presumably your home server)** must be alive 24/7 and UPS powered. The UPS must also backup the Internel Appliances (Router, ONT, switch etc). To have Internel when the power is down.
 
 ## Installation
 
 ```bash
 # Build
 go build -ldflags="-s -w" -trimpath
-
-# Or build statically (no CGO dependencies)
-CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath
 ```
 
 ## Configuration
@@ -44,8 +41,8 @@ mkdir -p ~/.config/iotping
 cat > ~/.config/iotping/config.json << 'EOF'
 {
   "devices": {
-    "DEVICE1": "192.168.1.10",
-    "DEVICE2": "192.168.1.11"
+    "DEVICE1": "192.168.1.10", // comments are allowed
+    "DEVICE2": "192.168.1.11"  /* C, C++ format */
   },
   "telegram-token": "YOUR_BOT_TOKEN",
   "telegram-chat-id": "YOUR_CHAT_ID",
@@ -75,7 +72,7 @@ EOF
 | `debug` | bool | `false` | Enable verbose debug logging |
 | `log-file` | string | `""` | Log file path (supports `~` and `$HOME`) |
 | `repeat-interval` | string | `"1h"` | Interval between repeat notifications while offline |
-| `max-repeat-notifications` | int | `3` | Maximum repeat notifications (0 = disabled) |
+| `max-repeat-notifications` | int | `3` | Maximum repeated notifications (0 = disabled) |
 
 ## Getting Telegram Credentials
 
