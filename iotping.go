@@ -161,6 +161,9 @@ func hasCommaAtEnd(result []byte, endIdx int) bool {
 }
 
 // addMissingCommas adds commas between elements where missing
+// NOTE: This assumes string values don't contain escaped quotes (")
+// This is safe for iotping configs where values are device names, IPs,
+// tokens, and file paths - none of which contain quotes
 func addMissingCommas(data []byte) ([]byte, []int) {
 	result := make([]byte, 0, len(data))
 	changedLines := []int{}
