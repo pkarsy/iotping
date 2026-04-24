@@ -138,6 +138,132 @@ func stripComments(data []byte) []byte {
 	return result
 }
 
+func countLines(data []byte) int {
+	count := 0
+	for _, b := range data {
+		if b == '\n' {
+			count++
+		}
+	}
+	return count
+}
+
+func hasCommaAtEnd(result []byte, endIdx int) bool {
+	for i := endIdx + 1; i < len(result); i++ {
+		if result[i] == ',' {
+			return true
+		}
+		if result[i] != ' ' && result[i] != '\t' && result[i] != '\n' && result[i] != '\r' {
+			break
+		}
+	}
+	return false
+}
+
+// addMissingCommas adds commas between elements where missing
+func addMissingCommas(data []byte) ([]byte, []int) {
+	result := make([]byte, 0, len(data))
+	changedLines := []int{}
+	i := 0
+
+	for i < len(data) {
+		// Copy char first
+		result = append(result, data[i])
+
+		// After copying a closing quote, check if comma is needed
+		if data[i] == '"' && i > 0 {
+			// Check this is the closing quote of a string value (not a key)
+			// Find the matching opening quote in result
+			if findPrevMatchingQuote(result) {
+				// Good - this ends a string. Check what comes next in original data
+				nextIdx := i + 1
+				for nextIdx < len(data) && (data[nextIdx] == ' ' || data[nextIdx] == '\t' || data[nextIdx] == '\n' || data[nextIdx] == '\r') {
+					nextIdx++
+				}
+				// If next is " or { or [ or } or ], may need comma
+				if nextIdx < len(data) && (data[nextIdx] == '"' || data[nextIdx] == '{' || data[nextIdx] == '[' || data[nextIdx] == '}' || data[nextIdx] == ']') {
+					// Don't add if } or ] immediately follows (unless there's stuff in between)
+					if data[nextIdx] != '}' && data[nextIdx] != ']' {
+						// Only add if we don't already have a comma
+						if len(result) >= 2 && result[len(result)-2] != ',' && result[len(result)-1] != ',' {
+							// Verify this is actually preceded by value content (not just whitespace)
+							prev := len(result) - 2
+							for prev >= 0 && (result[prev] == ' ' || result[prev] == '\t' || result[prev] == '\n' || result[prev] == '\r') {
+								prev--
+							}
+							if prev >= 0 && result[prev] != ',' {
+								result = append(result, ',')
+								changedLines = append(changedLines, countLines(result)+1)
+							}
+						}
+					}
+				}
+			}
+		}
+		i++
+	}
+	return result, changedLines
+}
+
+func findPrevMatchingQuote(result []byte) bool {
+	// Find the matching opening quote for the closing quote we just added
+	// Look backwards to find the opening " that starts this string
+	if len(result) < 3 {
+		return false
+	}
+	quoteCount := 0
+	for idx := len(result) - 1; idx >= 0; idx-- {
+		if result[idx] == '"' {
+			quoteCount++
+			if quoteCount == 2 {
+				// Found opening quote - check if this is a value (preceded by :)
+				prev := idx - 1
+				for prev >= 0 && (result[prev] == ' ' || result[prev] == '\t') {
+					prev--
+				}
+				if prev >= 0 && result[prev] == ':' {
+					return true
+				}
+				return false
+			}
+		}
+	}
+	return false
+}
+
+// fixTrailingCommas removes trailing commas before } or ]
+func fixTrailingCommas(data []byte) ([]byte, []int) {
+	result := make([]byte, 0, len(data))
+	changedLines := []int{}
+	i := 0
+	lineNum := 1
+
+	for i < len(data) {
+		if data[i] == ',' {
+			// Look ahead to find next non-whitespace/non-newline char
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				if data[j] == '\n' {
+					lineNum++
+				}
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				// This is a trailing comma - skip it
+				changedLines = append(changedLines, lineNum)
+				i++
+				continue
+			}
+		}
+		if data[i] == '\n' {
+			lineNum++
+		}
+		result = append(result, data[i])
+		i++
+	}
+	return result, changedLines
+}
+
 // expandPath expands ~ and $HOME at the start of a path
 func expandPath(path, home string) string {
 	if path == "" {
@@ -763,8 +889,18 @@ func loadConfig(path string) Config {
 		log.Fatalf("Failed to read config file %s: %v", path, err)
 	}
 
-	// Strip comments from JSON (both // and /* */ style)
+	// Process JSON: strip comments, add missing commas, fix trailing commas
 	data = stripComments(data)
+
+	data, missingLines := addMissingCommas(data)
+	if len(missingLines) > 0 {
+		log.Printf("[iotping] Warning: Missing commas added (lines: %v)", missingLines)
+	}
+
+	data, trailingLines := fixTrailingCommas(data)
+	if len(trailingLines) > 0 {
+		log.Printf("[iotping] Warning: Trailing commas removed (lines: %v)", trailingLines)
+	}
 
 	// Use a temporary struct to parse JSON with string durations
 	// Supports both hyphen and underscore variants for backward compatibility
