@@ -516,11 +516,13 @@ func (cw *ConfigWatcher) triggerReload() {
 // tryLoadConfig attempts to load config, returns error if invalid
 func tryLoadConfig(path string) (Config, error) {
 	cfg := Config{
-		Devices:          map[string]string{},
-		Interval:         60 * time.Second,
-		FailureThreshold: 3,
-		RecoveryNotify:   true,
-		PingTimeout:      5 * time.Second,
+		Devices:                map[string]string{},
+		Interval:               60 * time.Second,
+		FailureThreshold:       3,
+		RecoveryNotify:         true,
+		PingTimeout:            5 * time.Second,
+		RepeatInterval:         60 * time.Minute,
+		MaxRepeatNotifications: 3,
 	}
 
 	data, err := os.ReadFile(path)
@@ -529,15 +531,19 @@ func tryLoadConfig(path string) (Config, error) {
 	}
 
 	type configJSON struct {
-		Devices          map[string]string `json:"devices"`
-		TelegramToken    string            `json:"telegram-token"`
-		TelegramChatID   string            `json:"telegram-chat-id"`
-		Interval         string            `json:"interval"`
-		FailureThreshold int               `json:"failure-threshold"`
-		RecoveryNotify   bool              `json:"recovery-notify"`
-		PingTimeout      string            `json:"ping-timeout"`
-		Debug            bool              `json:"debug"`
-		LogFile          string            `json:"log-file"`
+		Devices                 map[string]string `json:"devices"`
+		TelegramToken           string            `json:"telegram-token"`
+		TelegramChatID          string            `json:"telegram-chat-id"`
+		Interval                string            `json:"interval"`
+		FailureThreshold        int               `json:"failure-threshold"`
+		RecoveryNotify          bool              `json:"recovery-notify"`
+		PingTimeout             string            `json:"ping-timeout"`
+		Debug                   bool              `json:"debug"`
+		LogFile                 string            `json:"log-file"`
+		RepeatInterval          string            `json:"repeat-interval"`
+		RepeatInterval_         string            `json:"repeat_interval"`
+		MaxRepeatNotifications  int               `json:"max-repeat-notifications"`
+		MaxRepeatNotifications_ int               `json:"max_repeat_notifications"`
 	}
 
 	var cj configJSON
@@ -561,6 +567,23 @@ func tryLoadConfig(path string) (Config, error) {
 	if cj.PingTimeout != "" {
 		if d, err := time.ParseDuration(cj.PingTimeout); err == nil {
 			cfg.PingTimeout = d
+		}
+	}
+
+	if cj.MaxRepeatNotifications != 0 {
+		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications
+	}
+	if cj.MaxRepeatNotifications_ != 0 {
+		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications_
+	}
+
+	repeatIntervalStr := cj.RepeatInterval
+	if cj.RepeatInterval_ != "" {
+		repeatIntervalStr = cj.RepeatInterval_
+	}
+	if repeatIntervalStr != "" {
+		if d, err := time.ParseDuration(repeatIntervalStr); err == nil {
+			cfg.RepeatInterval = d
 		}
 	}
 
@@ -968,7 +991,9 @@ func loadConfig(path string) Config {
 			cfg.PingTimeout = d
 		}
 	}
-	cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications
+	if cj.MaxRepeatNotifications != 0 {
+		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications
+	}
 	if cj.MaxRepeatNotifications_ != 0 {
 		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications_
 	}
