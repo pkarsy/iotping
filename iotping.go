@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -65,25 +69,38 @@ func NewPidFile(path string) *PidFile {
 }
 
 func (p *PidFile) Acquire() error {
-	// Check if PID file exists
-	if data, err := os.ReadFile(p.path); err == nil {
-		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-		if pid > 0 && isProcessRunning(pid) {
-			return fmt.Errorf("another instance is already running (PID: %d)", pid)
-		}
-		// Stale PID file, remove it
-		os.Remove(p.path)
-	}
-
 	// Ensure directory exists
 	dir := filepath.Dir(p.path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create PID file directory: %v", err)
 	}
 
-	// Write our PID
 	pid := os.Getpid()
-	return os.WriteFile(p.path, []byte(strconv.Itoa(pid)+"\n"), 0644)
+	// Create the PID file atomically (O_EXCL) so two instances started at the
+	// same moment cannot both pass the check (TOCTOU race).
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(p.path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", pid)
+			f.Close()
+			return nil
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("failed to create PID file %s: %v", p.path, err)
+		}
+
+		// PID file exists: check whether the owning process is still alive.
+		if data, rerr := os.ReadFile(p.path); rerr == nil {
+			if old, aerr := strconv.Atoi(strings.TrimSpace(string(data))); aerr == nil && old > 0 && isProcessRunning(old) {
+				return fmt.Errorf("another instance is already running (PID: %d)", old)
+			}
+		}
+		// Stale PID file, remove it and retry
+		if rerr := os.Remove(p.path); rerr != nil && !os.IsNotExist(rerr) {
+			return fmt.Errorf("failed to remove stale PID file %s: %v", p.path, rerr)
+		}
+	}
+	return fmt.Errorf("failed to acquire PID file %s", p.path)
 }
 
 func (p *PidFile) Release() {
@@ -100,18 +117,38 @@ func isProcessRunning(pid int) bool {
 	return err == nil
 }
 
-// debug logs a message only if debug mode is enabled
-func (m *Monitor) debug(format string, v ...interface{}) {
-	if m.config.Debug {
+// debugf logs a message only if debug mode is enabled
+func debugf(enabled bool, format string, v ...interface{}) {
+	if enabled {
 		log.Printf("[DEBUG] "+format, v...)
 	}
 }
 
-// stripComments removes // and /* */ style comments from JSON
+// stripComments removes // and /* */ style comments from JSON.
+// String literals are preserved verbatim: comment markers inside a string
+// value (e.g. a token or path containing "//") are data, not comments.
 func stripComments(data []byte) []byte {
 	result := make([]byte, 0, len(data))
 	i := 0
 	for i < len(data) {
+		// Copy whole string literals (handling escaped quotes) unchanged
+		if data[i] == '"' {
+			start := i
+			i++
+			for i < len(data) {
+				if data[i] == '\\' {
+					i += 2
+					continue
+				}
+				if data[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			result = append(result, data[start:i]...)
+			continue
+		}
 		if data[i] == '/' && i+1 < len(data) {
 			if data[i+1] == '/' {
 				// Skip // comment to end of line
@@ -336,8 +373,7 @@ Single Instance:
 
 Examples:
   iotping              # Run with default config
-  iotping --help       # Show this help
-`)
+  iotping --help       # Show this help`)
 }
 
 func parseArgs() string {
@@ -384,9 +420,11 @@ func main() {
 	cfg := loadConfig(configPath)
 
 	// Setup log file if specified
+	var logFile *os.File
 	if cfg.LogFile != "" {
 		logFilePath := expandPath(cfg.LogFile, home)
-		logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		var err error
+		logFile, err = os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.Fatalf("Failed to open log file %s: %v", logFilePath, err)
 		}
@@ -399,6 +437,16 @@ func main() {
 	}
 
 	mon := NewMonitor(cfg)
+	if !mon.icmpAvail {
+		// ICMP is required; exit with a non-zero status. os.Exit skips defers,
+		// so clean up the PID file and log file explicitly first.
+		pidFile.Release()
+		if logFile != nil {
+			logFile.Close()
+		}
+		log.Println("Exiting: ICMP unavailable")
+		os.Exit(1)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -464,7 +512,9 @@ func (cw *ConfigWatcher) Start(ctx context.Context) {
 			}
 			// Check if the event is for our config file
 			if event.Name == cw.path {
-				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+				// Handle Rename too: editors often save atomically by renaming a
+				// temp file over the config (vim-style), which only fires Rename.
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 					cw.handleChange()
 				}
 			}
@@ -513,7 +563,9 @@ func (cw *ConfigWatcher) triggerReload() {
 	}
 }
 
-// tryLoadConfig attempts to load config, returns error if invalid
+// tryLoadConfig loads and validates the config file. Returns an error if the
+// file is missing or invalid. On success the returned Config always has
+// positive durations and safe defaults for any unset field.
 func tryLoadConfig(path string) (Config, error) {
 	cfg := Config{
 		Devices:                map[string]string{},
@@ -530,20 +582,42 @@ func tryLoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 
+	// Process JSON: strip comments, add missing commas, fix trailing commas
+	data = stripComments(data)
+
+	data, missingLines := addMissingCommas(data)
+	if len(missingLines) > 0 {
+		log.Printf("[iotping] Warning: Missing commas added (lines: %v)", missingLines)
+	}
+
+	data, trailingLines := fixTrailingCommas(data)
+	if len(trailingLines) > 0 {
+		log.Printf("[iotping] Warning: Trailing commas removed (lines: %v)", trailingLines)
+	}
+
+	// Use a temporary struct to parse JSON with string durations.
+	// Supports both hyphen and underscore variants for backward compatibility.
+	// Pointer fields distinguish "not set" from an explicit zero value.
 	type configJSON struct {
 		Devices                 map[string]string `json:"devices"`
 		TelegramToken           string            `json:"telegram-token"`
+		TelegramToken_          string            `json:"telegram_token"`
 		TelegramChatID          string            `json:"telegram-chat-id"`
+		TelegramChatID_         string            `json:"telegram_chat_id"`
 		Interval                string            `json:"interval"`
 		FailureThreshold        int               `json:"failure-threshold"`
+		FailureThreshold_       int               `json:"failure_threshold"`
 		RecoveryNotify          bool              `json:"recovery-notify"`
+		RecoveryNotify_         bool              `json:"recovery_notify"`
 		PingTimeout             string            `json:"ping-timeout"`
+		PingTimeout_            string            `json:"ping_timeout"`
 		Debug                   bool              `json:"debug"`
 		LogFile                 string            `json:"log-file"`
+		LogFile_                string            `json:"log_file"`
 		RepeatInterval          string            `json:"repeat-interval"`
 		RepeatInterval_         string            `json:"repeat_interval"`
-		MaxRepeatNotifications  int               `json:"max-repeat-notifications"`
-		MaxRepeatNotifications_ int               `json:"max_repeat_notifications"`
+		MaxRepeatNotifications  *int              `json:"max-repeat-notifications"`
+		MaxRepeatNotifications_ *int              `json:"max_repeat_notifications"`
 	}
 
 	var cj configJSON
@@ -551,40 +625,31 @@ func tryLoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 
+	// Copy values (underscore variants take precedence if set)
 	cfg.Devices = cj.Devices
-	cfg.TelegramToken = cj.TelegramToken
-	cfg.TelegramChatID = cj.TelegramChatID
+	cfg.TelegramToken = firstNonEmpty(cj.TelegramToken, cj.TelegramToken_)
+	cfg.TelegramChatID = firstNonEmpty(cj.TelegramChatID, cj.TelegramChatID_)
 	cfg.FailureThreshold = cj.FailureThreshold
+	if cj.FailureThreshold_ != 0 {
+		cfg.FailureThreshold = cj.FailureThreshold_
+	}
 	cfg.RecoveryNotify = cj.RecoveryNotify
+	if cj.RecoveryNotify_ {
+		cfg.RecoveryNotify = cj.RecoveryNotify_
+	}
 	cfg.Debug = cj.Debug
-	cfg.LogFile = cj.LogFile
+	cfg.LogFile = firstNonEmpty(cj.LogFile, cj.LogFile_)
 
-	if cj.Interval != "" {
-		if d, err := time.ParseDuration(cj.Interval); err == nil {
-			cfg.Interval = d
-		}
-	}
-	if cj.PingTimeout != "" {
-		if d, err := time.ParseDuration(cj.PingTimeout); err == nil {
-			cfg.PingTimeout = d
-		}
-	}
+	cfg.Interval = parseDurationField(cj.Interval, cfg.Interval, "interval")
+	cfg.PingTimeout = parseDurationField(firstNonEmpty(cj.PingTimeout, cj.PingTimeout_), cfg.PingTimeout, "ping-timeout")
+	cfg.RepeatInterval = parseDurationField(firstNonEmpty(cj.RepeatInterval, cj.RepeatInterval_), cfg.RepeatInterval, "repeat-interval")
 
-	if cj.MaxRepeatNotifications != 0 {
-		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications
-	}
-	if cj.MaxRepeatNotifications_ != 0 {
-		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications_
-	}
-
-	repeatIntervalStr := cj.RepeatInterval
-	if cj.RepeatInterval_ != "" {
-		repeatIntervalStr = cj.RepeatInterval_
-	}
-	if repeatIntervalStr != "" {
-		if d, err := time.ParseDuration(repeatIntervalStr); err == nil {
-			cfg.RepeatInterval = d
-		}
+	// Pointer fields: an explicit 0 ("0 = disabled") must be honored; the old
+	// != 0 guard silently clobbered it back to the default.
+	if cj.MaxRepeatNotifications_ != nil {
+		cfg.MaxRepeatNotifications = *cj.MaxRepeatNotifications_
+	} else if cj.MaxRepeatNotifications != nil {
+		cfg.MaxRepeatNotifications = *cj.MaxRepeatNotifications
 	}
 
 	return cfg, nil
@@ -605,12 +670,21 @@ func NewMonitor(cfg Config) *Monitor {
 	return m
 }
 
-// Reload updates the config and resets all device states
+// Reload updates the config, preserving state for devices that are still
+// configured. Resetting states would make a still-down device re-send its
+// OFFLINE notification and lose its downtime history.
 func (m *Monitor) Reload(cfg Config) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.config = cfg
-	m.states = make(map[string]*DeviceState) // Reset all counters
+
+	newStates := make(map[string]*DeviceState, len(cfg.Devices))
+	for name := range cfg.Devices {
+		if st, ok := m.states[name]; ok {
+			newStates[name] = st
+		}
+	}
+	m.states = newStates
 }
 
 // testICMP checks if unprivileged ICMP works on this system
@@ -632,7 +706,7 @@ func (m *Monitor) testICMP() bool {
 		log.Println("     (Note: must be re-run after each recompile)")
 		log.Println("")
 		log.Println("  3. Run as root (not recommended for security)")
-		os.Exit(1)
+		return false
 	}
 	conn.Close()
 	return true
@@ -652,7 +726,7 @@ func (m *Monitor) Run(ctx context.Context) {
 		case <-ticker.C:
 			m.checkAll(ctx)
 		case <-queueTicker.C:
-			m.flushQueue()
+			m.flushQueue(m.config)
 		case newCfg := <-m.reloadCh:
 			// Config already validated by watcher before sending
 			ticker.Stop()
@@ -660,7 +734,7 @@ func (m *Monitor) Run(ctx context.Context) {
 			m.Reload(newCfg)
 			ticker = time.NewTicker(m.config.Interval)
 			queueTicker = time.NewTicker(5 * time.Minute)
-			log.Println("Config reloaded, all counters reset")
+			log.Println("Config reloaded")
 		case <-ctx.Done():
 			return
 		}
@@ -668,24 +742,30 @@ func (m *Monitor) Run(ctx context.Context) {
 }
 
 func (m *Monitor) checkAll(ctx context.Context) {
+	// Snapshot the config under the read lock: a concurrent reload must not
+	// race with the lock-free reads done by the worker goroutines.
+	m.mu.RLock()
+	cfg := m.config
+	m.mu.RUnlock()
+
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
 
-	for name, ip := range m.config.Devices {
+	for name, ip := range cfg.Devices {
 		wg.Add(1)
 		semaphore <- struct{}{}
 
 		go func(name, ip string) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
-			m.checkDevice(ctx, name, ip)
+			m.checkDevice(ctx, cfg, name, ip)
 		}(name, ip)
 	}
 
 	wg.Wait()
 }
 
-func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
+func (m *Monitor) checkDevice(ctx context.Context, cfg Config, name, ip string) {
 	m.mu.Lock()
 	state, exists := m.states[name]
 	if !exists {
@@ -696,63 +776,73 @@ func (m *Monitor) checkDevice(ctx context.Context, name, ip string) {
 	m.mu.Unlock()
 
 	// Use ICMP only
-	isOnline := m.checkICMP(ip)
+	isOnline := m.checkICMP(ctx, ip, cfg)
 
+	// Update state under the lock, but build the notification outside of it so
+	// sendTelegram (network I/O) never blocks other device checks.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	var notifyMsg string
+	notifyNow, queueOnFailure := false, false
 	if !isOnline {
 		state.Failures++
-		if state.Failures >= m.config.FailureThreshold && state.IsOnline {
+		if state.Failures >= cfg.FailureThreshold && state.IsOnline {
 			state.IsOnline = false
 			state.LastChange = time.Now()
 			state.LastNotified = time.Now()
 			state.NotifyCount = 1
 			eventTime := state.LastChange.Format("15:04")
-			m.mu.Unlock()
-			msg := fmt.Sprintf("🚨 %s OFFLINE (%s)", name, eventTime)
 			log.Printf("[iotping] %s is OFFLINE", name)
-			m.notify(msg, true)
-			m.mu.Lock()
-		} else if !state.IsOnline && state.NotifyCount > 0 && state.NotifyCount < m.config.MaxRepeatNotifications {
+			notifyNow, queueOnFailure = true, true
+			notifyMsg = fmt.Sprintf("🚨 %s OFFLINE (%s)", name, eventTime)
+		} else if !state.IsOnline && state.NotifyCount > 0 && state.NotifyCount < cfg.MaxRepeatNotifications {
 			timeSinceLastNotify := time.Since(state.LastNotified)
-			if timeSinceLastNotify >= m.config.RepeatInterval {
+			if timeSinceLastNotify >= cfg.RepeatInterval {
 				state.NotifyCount++
 				state.LastNotified = time.Now()
 				downtime := time.Since(state.LastChange)
 				eventTime := state.LastChange.Format("15:04")
-				m.mu.Unlock()
-				var msg string
-				if state.NotifyCount >= m.config.MaxRepeatNotifications {
-					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s) - no more notifications", name, downtime.Round(time.Minute), eventTime)
+				log.Printf("[iotping] %s still offline (%s) - repeat notification %d/%d", name, downtime.Round(time.Minute), state.NotifyCount, cfg.MaxRepeatNotifications)
+				notifyNow = true
+				if state.NotifyCount >= cfg.MaxRepeatNotifications {
+					notifyMsg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s) - no more notifications", name, downtime.Round(time.Minute), eventTime)
 				} else {
-					msg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s)", name, downtime.Round(time.Minute), eventTime)
+					notifyMsg = fmt.Sprintf("🚨 %s STILL OFFLINE (%s) (%s)", name, downtime.Round(time.Minute), eventTime)
 				}
-				log.Printf("[iotping] %s still offline (%s) - repeat notification %d/%d", name, downtime.Round(time.Minute), state.NotifyCount, m.config.MaxRepeatNotifications)
-				m.notify(msg, false)
-				m.mu.Lock()
 			}
 		}
 	} else {
-		if !state.IsOnline && m.config.RecoveryNotify {
+		if !state.IsOnline && cfg.RecoveryNotify {
 			downtime := time.Since(state.LastChange)
 			eventTime := state.LastChange.Format("15:04")
-			m.mu.Unlock()
-			msg := fmt.Sprintf("✅ %s ONLINE (%s) (%s)", name, downtime.Round(time.Second), eventTime)
 			log.Printf("[iotping] %s is BACK ONLINE (downtime: %s)", name, downtime.Round(time.Second))
-			m.notify(msg, true)
-			m.mu.Lock()
+			notifyNow, queueOnFailure = true, true
+			notifyMsg = fmt.Sprintf("✅ %s ONLINE (%s) (%s)", name, downtime.Round(time.Second), eventTime)
 		}
 		if state.Failures > 0 {
-			m.debug("[%s] Back online (was down %d checks)", name, state.Failures)
+			debugf(cfg.Debug, "[%s] Back online (was down %d checks)", name, state.Failures)
 		}
 		state.Failures = 0
 		state.IsOnline = true
 		state.NotifyCount = 0
 	}
+	m.mu.Unlock()
+
+	if notifyNow {
+		m.notify(notifyMsg, queueOnFailure, cfg)
+	}
 }
 
-func (m *Monitor) checkICMP(ip string) bool {
+// randomToken returns a random hex string used to tag ICMP echo requests so
+// replies can be verified as ours.
+func randomToken() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+func (m *Monitor) checkICMP(ctx context.Context, ip string, cfg Config) bool {
 	dst, err := net.ResolveIPAddr("ip4", ip)
 	if err != nil {
 		return false
@@ -766,64 +856,93 @@ func (m *Monitor) checkICMP(ip string) bool {
 	}
 	defer conn.Close()
 
+	// Unique token + random seq so a stale or unrelated echo reply is never
+	// mistaken for a response from the device we pinged. Note: with unprivileged
+	// UDP ping the kernel fills the ICMP ID, so replies are matched by payload.
+	token := randomToken()
+	echo := &icmp.Echo{
+		ID:   os.Getpid() & 0xffff,
+		Seq:  mrand.IntN(0x10000),
+		Data: []byte(token),
+	}
 	msg := &icmp.Message{
 		Type: ipv4.ICMPTypeEcho,
 		Code: 0,
-		Body: &icmp.Echo{
-			ID:   os.Getpid() & 0xffff,
-			Seq:  1,
-			Data: []byte("monitor"),
-		},
+		Body: echo,
 	}
 	data, err := msg.Marshal(nil)
 	if err != nil {
 		return false
 	}
 
-	m.debug("[ICMP] PING -> %s", ip)
+	debugf(cfg.Debug, "[ICMP] PING -> %s", ip)
 	udpDst := &net.UDPAddr{IP: dst.IP, Zone: dst.Zone}
 	if _, err := conn.WriteTo(data, udpDst); err != nil {
-		m.debug("[ICMP] PING send failed to %s: %v", ip, err)
+		debugf(cfg.Debug, "[ICMP] PING send failed to %s: %v", ip, err)
 		return false
 	}
 
+	// Close the socket when the context is cancelled so the blocked read
+	// returns immediately during shutdown.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-stop:
+		}
+	}()
+
 	reply := make([]byte, 1500)
-	conn.SetReadDeadline(time.Now().Add(m.config.PingTimeout))
+	conn.SetReadDeadline(time.Now().Add(cfg.PingTimeout))
 	n, peer, err := conn.ReadFrom(reply)
 	if err != nil {
-		m.debug("[ICMP] PING timeout/no reply from %s: %v", ip, err)
+		debugf(cfg.Debug, "[ICMP] PING timeout/no reply from %s: %v", ip, err)
 		return false
 	}
 
 	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), reply[:n])
 	if err != nil {
-		m.debug("[ICMP] PING invalid reply from %s: %v", ip, err)
+		debugf(cfg.Debug, "[ICMP] PING invalid reply from %s: %v", ip, err)
 		return false
 	}
 
-	if rm.Type == ipv4.ICMPTypeEchoReply {
-		m.debug("[ICMP] PONG <- %s (from %s)", ip, peer)
-		return true
+	// Verify the reply is an echo reply from the target carrying our token.
+	if rm.Type != ipv4.ICMPTypeEchoReply {
+		debugf(cfg.Debug, "[ICMP] PING unexpected reply type from %s: %v", ip, rm.Type)
+		return false
 	}
-	m.debug("[ICMP] PING unexpected reply type from %s: %v", ip, rm.Type)
-	return false
+	tokenBytes := []byte(token)
+	body, ok := rm.Body.(*icmp.Echo)
+	if !ok || !bytes.Equal(body.Data, tokenBytes) {
+		debugf(cfg.Debug, "[ICMP] PING reply from %s did not match our request", ip)
+		return false
+	}
+	if peerAddr, ok := peer.(*net.UDPAddr); !ok || !peerAddr.IP.Equal(dst.IP) {
+		debugf(cfg.Debug, "[ICMP] PING reply from unexpected source: %v", peer)
+		return false
+	}
+
+	debugf(cfg.Debug, "[ICMP] PONG <- %s (from %s)", ip, peer)
+	return true
 }
 
 const maxQueueSize = 25
 
-func (m *Monitor) notify(message string, queueOnFailure bool) {
-	if m.config.TelegramToken == "" {
+func (m *Monitor) notify(message string, queueOnFailure bool, cfg Config) {
+	if cfg.TelegramToken == "" {
 		log.Printf("[iotping DRY RUN] %s", message)
 		return
 	}
 
 	// Try to flush any queued messages first
-	m.flushQueue()
+	m.flushQueue(cfg)
 
 	// Try to send the current message
-	if m.sendTelegram(message) {
+	if m.sendTelegram(message, cfg) {
 		// Success - try to flush queue again in case more were added
-		m.flushQueue()
+		m.flushQueue(cfg)
 	} else if queueOnFailure {
 		// Failed - add to queue (only for important messages)
 		m.queueMu.Lock()
@@ -839,28 +958,34 @@ func (m *Monitor) notify(message string, queueOnFailure bool) {
 	}
 }
 
-func (m *Monitor) sendTelegram(message string) bool {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.config.TelegramToken)
+func (m *Monitor) sendTelegram(message string, cfg Config) bool {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.TelegramToken)
 	payload := map[string]string{
-		"chat_id":    m.config.TelegramChatID,
-		"text":       message,
-		"parse_mode": "Markdown",
+		"chat_id": cfg.TelegramChatID,
+		"text":    message,
 	}
 
-	jsonData, _ := json.Marshal(payload)
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[iotping] Failed to encode Telegram message: %v", err)
+		return false
+	}
 	resp, err := m.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
+	// Drain the body so the connection can be reused; also surfaces API errors.
+	io.Copy(io.Discard, resp.Body)
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[iotping] Telegram API error: %s", resp.Status)
 		return false
 	}
 	return true
 }
 
-func (m *Monitor) flushQueue() {
+func (m *Monitor) flushQueue(cfg Config) {
 	m.queueMu.Lock()
 	if len(m.msgQueue) == 0 {
 		m.queueMu.Unlock()
@@ -876,15 +1001,12 @@ func (m *Monitor) flushQueue() {
 	// Try to send all queued messages
 	sent := 0
 	for _, msg := range queue {
-		if m.sendTelegram(msg) {
+		if m.sendTelegram(msg, cfg) {
 			sent++
 		} else {
-			// Put remaining messages back in queue
+			// Put the unsent remainder back in the queue, preserving order.
 			m.queueMu.Lock()
-			m.msgQueue = append([]string{msg}, m.msgQueue...)
-			for _, remaining := range queue[sent+1:] {
-				m.msgQueue = append([]string{remaining}, m.msgQueue...)
-			}
+			m.msgQueue = append(queue[sent:], m.msgQueue...)
 			m.queueMu.Unlock()
 			if sent > 0 {
 				log.Printf("[iotping] Sent %d queued messages, %d remain", sent, len(queue)-sent)
@@ -899,114 +1021,38 @@ func (m *Monitor) flushQueue() {
 }
 
 func loadConfig(path string) Config {
-	// Default config
-	cfg := Config{
-		Devices:                map[string]string{},
-		Interval:               60 * time.Second,
-		FailureThreshold:       3,
-		RecoveryNotify:         true,
-		PingTimeout:            5 * time.Second,
-		RepeatInterval:         60 * time.Minute,
-		MaxRepeatNotifications: 3,
-	}
-
-	data, err := os.ReadFile(path)
+	cfg, err := tryLoadConfig(path)
 	if err != nil {
-		log.Fatalf("Failed to read config file %s: %v", path, err)
+		log.Fatalf("Failed to load config file %s: %v", path, err)
 	}
-
-	// Process JSON: strip comments, add missing commas, fix trailing commas
-	data = stripComments(data)
-
-	data, missingLines := addMissingCommas(data)
-	if len(missingLines) > 0 {
-		log.Printf("[iotping] Warning: Missing commas added (lines: %v)", missingLines)
-	}
-
-	data, trailingLines := fixTrailingCommas(data)
-	if len(trailingLines) > 0 {
-		log.Printf("[iotping] Warning: Trailing commas removed (lines: %v)", trailingLines)
-	}
-
-	// Use a temporary struct to parse JSON with string durations
-	// Supports both hyphen and underscore variants for backward compatibility
-	type configJSON struct {
-		Devices                 map[string]string `json:"devices"`
-		TelegramToken           string            `json:"telegram-token"`
-		TelegramToken_          string            `json:"telegram_token"`
-		TelegramChatID          string            `json:"telegram-chat-id"`
-		TelegramChatID_         string            `json:"telegram_chat_id"`
-		Interval                string            `json:"interval"`
-		FailureThreshold        int               `json:"failure-threshold"`
-		FailureThreshold_       int               `json:"failure_threshold"`
-		RecoveryNotify          bool              `json:"recovery-notify"`
-		RecoveryNotify_         bool              `json:"recovery_notify"`
-		PingTimeout             string            `json:"ping-timeout"`
-		PingTimeout_            string            `json:"ping_timeout"`
-		Debug                   bool              `json:"debug"`
-		LogFile                 string            `json:"log-file"`
-		LogFile_                string            `json:"log_file"`
-		RepeatInterval          string            `json:"repeat-interval"`
-		RepeatInterval_         string            `json:"repeat_interval"`
-		MaxRepeatNotifications  int               `json:"max-repeat-notifications"`
-		MaxRepeatNotifications_ int               `json:"max_repeat_notifications"`
-	}
-
-	var cj configJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		log.Fatalf("Failed to parse config file: %v", err)
-	}
-
-	// Copy values (underscore variants take precedence if set)
-	cfg.Devices = cj.Devices
-	cfg.TelegramToken = cj.TelegramToken
-	if cj.TelegramToken_ != "" {
-		cfg.TelegramToken = cj.TelegramToken_
-	}
-	cfg.TelegramChatID = cj.TelegramChatID
-	if cj.TelegramChatID_ != "" {
-		cfg.TelegramChatID = cj.TelegramChatID_
-	}
-	cfg.FailureThreshold = cj.FailureThreshold
-	if cj.FailureThreshold_ != 0 {
-		cfg.FailureThreshold = cj.FailureThreshold_
-	}
-	cfg.RecoveryNotify = cj.RecoveryNotify
-	if cj.RecoveryNotify_ {
-		cfg.RecoveryNotify = cj.RecoveryNotify_
-	}
-	cfg.Debug = cj.Debug
-	cfg.LogFile = cj.LogFile
-	if cj.LogFile_ != "" {
-		cfg.LogFile = cj.LogFile_
-	}
-
-	if cj.Interval != "" {
-		if d, err := time.ParseDuration(cj.Interval); err == nil {
-			cfg.Interval = d
-		}
-	}
-	if cj.PingTimeout != "" {
-		if d, err := time.ParseDuration(cj.PingTimeout); err == nil {
-			cfg.PingTimeout = d
-		}
-	}
-	if cj.MaxRepeatNotifications != 0 {
-		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications
-	}
-	if cj.MaxRepeatNotifications_ != 0 {
-		cfg.MaxRepeatNotifications = cj.MaxRepeatNotifications_
-	}
-
-	repeatIntervalStr := cj.RepeatInterval
-	if cj.RepeatInterval_ != "" {
-		repeatIntervalStr = cj.RepeatInterval_
-	}
-	if repeatIntervalStr != "" {
-		if d, err := time.ParseDuration(repeatIntervalStr); err == nil {
-			cfg.RepeatInterval = d
-		}
-	}
-
 	return cfg
+}
+
+// firstNonEmpty returns the first non-empty string argument.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseDurationField parses a duration from config; invalid or non-positive
+// values fall back to `fallback` with a warning instead of crashing later
+// (e.g. time.NewTicker(0) panics).
+func parseDurationField(s string, fallback time.Duration, name string) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		log.Printf("[iotping] Warning: invalid %s %q, using default %s", name, s, fallback)
+		return fallback
+	}
+	if d <= 0 {
+		log.Printf("[iotping] Warning: %s must be positive (%q), using default %s", name, s, fallback)
+		return fallback
+	}
+	return d
 }

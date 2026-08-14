@@ -58,6 +58,12 @@ cat > ~/.config/iotping/config.json << 'EOF'
 EOF
 ```
 
+**Secure your token**: `config.json` contains your Telegram bot token. Make sure only your user can read it:
+
+```bash
+chmod 600 ~/.config/iotping/config.json
+```
+
 ### Config Options
 
 | Option | Type | Default | Description |
