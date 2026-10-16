@@ -702,7 +702,7 @@ func (m *Monitor) testICMP() bool {
 		log.Println("                sudo sysctl --system")
 		log.Println("")
 		log.Println("  2. Grant CAP_NET_RAW capability to the binary:")
-		log.Println("     sudo setcap cap_net_raw+ep ./iotpinger")
+		log.Println("     sudo setcap cap_net_raw+ep ./iotping")
 		log.Println("     (Note: must be re-run after each recompile)")
 		log.Println("")
 		log.Println("  3. Run as root (not recommended for security)")
